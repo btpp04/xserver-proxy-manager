@@ -1,15 +1,13 @@
 package com.btpp.proxy;
 
-import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import org.bukkit.plugin.java.JavaPlugin;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
+import java.nio.channels.*;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -19,6 +17,8 @@ public class ProxyPlugin extends JavaPlugin {
     private Logger logger;
     private ServerSocketChannel serverChannel;
     private Selector selector;
+    private volatile boolean running = true;
+    private final Map<SocketChannel, SocketChannel> channelMap = new HashMap<>();
     private int listenPort = 25575;
 
     @Override
@@ -27,20 +27,14 @@ public class ProxyPlugin extends JavaPlugin {
         logger.info("XServer Proxy Manager 正在启动...");
 
         try {
-            // 初始化选择器
             selector = Selector.open();
-
-            // 创建服务端通道
             serverChannel = ServerSocketChannel.open();
             serverChannel.configureBlocking(false);
-
-            // 绑定端口
             serverChannel.socket().bind(new InetSocketAddress(listenPort));
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
             logger.info("SOCKS5 代理已启动，监听端口: " + listenPort);
 
-            // 启动代理线程
             Thread proxyThread = new Thread(this::proxyLoop);
             proxyThread.setDaemon(true);
             proxyThread.setName("SOCKS5-Proxy");
@@ -55,6 +49,7 @@ public class ProxyPlugin extends JavaPlugin {
     @Override
     public void onDisable() {
         logger.info("XServer Proxy Manager 正在关闭...");
+        running = false;
 
         try {
             if (serverChannel != null && serverChannel.isOpen()) {
@@ -72,18 +67,21 @@ public class ProxyPlugin extends JavaPlugin {
 
     private void proxyLoop() {
         try {
-            while (!selector.closed()) {
-                int n = selector.select();
+            while (running && selector.isOpen()) {
+                int n = selector.select(1000);
                 if (n == 0) continue;
 
                 Set<SelectionKey> selectedKeys = selector.selectedKeys();
                 for (SelectionKey key : selectedKeys) {
-                    if (key.isAcceptable()) {
-                        handleAccept(key);
-                    } else if (key.isReadable()) {
-                        handleRead(key);
-                    } else if (key.isWritable()) {
-                        handleWrite(key);
+                    try {
+                        if (key.isAcceptable()) {
+                            handleAccept(key);
+                        } else if (key.isReadable()) {
+                            handleRead(key);
+                        }
+                    } catch (IOException e) {
+                        key.cancel();
+                        key.channel().close();
                     }
                 }
                 selectedKeys.clear();
@@ -98,21 +96,19 @@ public class ProxyPlugin extends JavaPlugin {
         SocketChannel clientChannel = server.accept();
         if (clientChannel != null) {
             clientChannel.configureBlocking(false);
-            // 注册读取事件
             clientChannel.register(selector, SelectionKey.OP_READ);
-            logger.info("客户端连接: " + clientChannel.socket().getRemoteSocketAddress());
         }
     }
 
     private void handleRead(SelectionKey key) throws IOException {
-        SocketChannel clientChannel = (SocketChannel) key.channel();
+        SocketChannel channel = (SocketChannel) key.channel();
         ByteBuffer buffer = ByteBuffer.allocate(8192);
-        int bytesRead = clientChannel.read(buffer);
+        int bytesRead = channel.read(buffer);
 
-        if (bytesRead == -1) {
-            // 连接关闭
-            clientChannel.close();
+        if (bytesRead <= 0) {
+            channel.close();
             key.cancel();
+            channelMap.remove(channel);
             return;
         }
 
@@ -120,21 +116,23 @@ public class ProxyPlugin extends JavaPlugin {
         byte[] data = new byte[bytesRead];
         buffer.get(data);
 
-        // 处理 SOCKS5 请求
-        if (data.length > 0 && data[0] == 0x05) {
-            handleSocks5Request(clientChannel, data);
+        // 如果是客户端连接，先处理 SOCKS5 协议
+        SocketChannel partner = channelMap.get(channel);
+        if (partner == null && data.length > 0 && data[0] == 0x05) {
+            handleSocks5Request(channel, data);
+        } else if (partner != null) {
+            // 转发数据到对端
+            partner.write(ByteBuffer.wrap(data));
         }
     }
 
     private void handleSocks5Request(SocketChannel clientChannel, byte[] initialData) throws IOException {
-        // 解析 SOCKS5 请求
         if (initialData.length < 4) return;
-        
+
         byte version = initialData[0];
         byte method = initialData[1];
 
         if (version != 0x05) {
-            // 不支持的版本
             ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0xFF});
             clientChannel.write(resp);
             clientChannel.close();
@@ -142,10 +140,9 @@ public class ProxyPlugin extends JavaPlugin {
         }
 
         if (method == 0x00) {
-            // 认证通过
             ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0x00});
             clientChannel.write(resp);
-            
+
             // 读取 CONNECT 请求
             ByteBuffer connectBuf = ByteBuffer.allocate(1024);
             int bytesRead = clientChannel.read(connectBuf);
@@ -156,7 +153,6 @@ public class ProxyPlugin extends JavaPlugin {
                 handleSocks5Connect(clientChannel, connectData);
             }
         } else {
-            // 需要认证
             ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0x02});
             clientChannel.write(resp);
         }
@@ -167,18 +163,15 @@ public class ProxyPlugin extends JavaPlugin {
 
         byte version = requestData[0];
         byte cmd = requestData[1];
-        byte reserved = requestData[2];
         byte atype = requestData[3];
 
         if (version != 0x05 || cmd != 0x01) {
-            // 只支持 SOCKS5 CONNECT 命令
             ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
             clientChannel.write(resp);
             clientChannel.close();
             return;
         }
 
-        // 解析目标地址
         String host;
         int port;
 
@@ -214,40 +207,33 @@ public class ProxyPlugin extends JavaPlugin {
 
         logger.info("SOCKS5 CONNECT 请求: " + host + ":" + port);
 
-        // 创建到目标地址的连接
         SocketChannel targetChannel = SocketChannel.open();
         targetChannel.configureBlocking(false);
 
         try {
-            targetChannel.connect(new InetSocketAddress(host, port));
-            
-            // 等待连接完成
-            if (targetChannel.finishConnect()) {
-                // 连接成功
-                ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
-                clientChannel.write(resp);
-                
-                // 注册双向通道
-                targetChannel.register(selector, SelectionKey.OP_READ);
-                clientChannel.register(selector, SelectionKey.OP_READ);
-                
-                // 保存通道对
-                clientChannel.attach(targetChannel);
-                targetChannel.attach(clientChannel);
-                
-                logger.info("SOCKS5 连接已建立: " + host + ":" + port);
+            boolean connected = targetChannel.connect(new InetSocketAddress(host, port));
+            if (!connected) {
+                // 等待连接完成
+                SelectionKey writeKey = targetChannel.register(selector, SelectionKey.OP_CONNECT);
+                targetChannel.finishConnect();
             }
+
+            ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+            clientChannel.write(resp);
+
+            // 建立双向映射
+            channelMap.put(clientChannel, targetChannel);
+            channelMap.put(targetChannel, clientChannel);
+
+            targetChannel.register(selector, SelectionKey.OP_READ);
+            logger.info("SOCKS5 连接已建立: " + host + ":" + port);
+
         } catch (IOException e) {
-            // 连接失败
             ByteBuffer resp = ByteBuffer.wrap(new byte[]{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
             clientChannel.write(resp);
             clientChannel.close();
             targetChannel.close();
             logger.log(Level.WARNING, "SOCKS5 连接失败: " + host + ":" + port, e);
         }
-    }
-
-    private void handleWrite(SelectionKey key) throws IOException {
-        // 写入处理在 read 中完成
     }
 }
